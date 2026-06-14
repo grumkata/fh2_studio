@@ -105,41 +105,49 @@ class ICNHeader:
 
 
 def parse_icn(blob: bytes) -> tuple[list[ICNHeader], list[bytes]]:
-    """Split a raw ICN blob into (headers, per-sprite RLE byte strings)."""
+    """Split a raw ICN blob into (headers, per-sprite RLE byte strings).
+
+    Lenient by design: original HOMM2 AGG files routinely have blockSize values
+    larger than the bytes actually stored, and offsetData sequences that extend
+    past the available data.  We clamp everything silently rather than raising,
+    returning an empty bytes object for any sprite whose data cannot be read.
+    Only raises IcnFormatError when the blob is too small for the top-level header.
+    """
     if len(blob) < TOP_HEADER_SIZE:
         raise IcnFormatError("blob too small to be an ICN container")
 
     count, block_size = struct.unpack_from("<HI", blob, 0)
 
+    # Read as many sprite headers as are physically present.
     headers: list[ICNHeader] = []
     for i in range(count):
         off = TOP_HEADER_SIZE + i * ICN_HEADER_SIZE
         if off + ICN_HEADER_SIZE > len(blob):
-            raise IcnFormatError(f"ICN header {i} runs past end of blob")
+            break   # truncated header table — stop here, do not raise
         headers.append(ICNHeader.unpack(blob, off))
 
-    data_start = TOP_HEADER_SIZE + count * ICN_HEADER_SIZE
+    actual_count = len(headers)
+    data_start   = TOP_HEADER_SIZE + actual_count * ICN_HEADER_SIZE
 
-    # How many bytes of sprite data are actually present in the blob.
-    # blockSize from the ICN header CAN exceed this in original HOMM2 files
-    # (the stored AGG entry is sometimes shorter than blockSize claims).
-    # We always clamp to what is physically available.
-    available_data = len(blob) - data_start
+    # How many data bytes are physically present (blockSize often exceeds this).
+    available = max(0, len(blob) - data_start)
 
     sprite_data: list[bytes] = []
     for i, hdr in enumerate(headers):
-        if i + 1 != count:
-            data_size = headers[i + 1].offsetData - hdr.offsetData
+        # Clamp the start offset so it never exceeds available bytes.
+        s_off = min(max(hdr.offsetData, 0), available)
+
+        if i + 1 < actual_count:
+            # Between sprites: end = next sprite's start offset.
+            e_off = min(max(headers[i + 1].offsetData, 0), available)
         else:
-            # Last sprite: use whichever is smaller — blockSize or actual bytes present.
-            data_size = min(block_size, available_data) - hdr.offsetData
+            # Last sprite: use blockSize, clamped to what is actually present.
+            e_off = min(max(block_size, 0), available)
 
-        start = data_start + hdr.offsetData
-        end = start + data_size
-        if data_size < 0 or end > len(blob):
-            raise IcnFormatError(f"sprite {i} data range [{start}:{end}] invalid for blob of size {len(blob)}")
+        # Guard against inverted ranges from corrupt offsetData ordering.
+        e_off = max(s_off, e_off)
 
-        sprite_data.append(blob[start:end])
+        sprite_data.append(blob[data_start + s_off : data_start + e_off])
 
     return headers, sprite_data
 

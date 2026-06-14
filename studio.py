@@ -182,16 +182,20 @@ class Studio(tk.Tk):
         self.minsize(960, 640)
 
         self.project = Project()
-        self._fheroes2_dir: str = ""   # set by _connect_fheroes2 or _open_agg
-        self._sel_asset = None          # currently selected AssetEntry
-        self._sel_music = None          # currently selected MusicEntry
-        self._sel_sprite_idx = 0        # sprite frame index within ICN
+        self._fheroes2_dir: str = ""
+        self._music_playing  = False
+        self._music_paused   = False
+        self._music_duration = 0.0
+        self._sel_asset = None
+        self._sel_music = None
+        self._sel_sprite_idx = 0
         self._preview_photo: ImageTk.PhotoImage | None = None
         self._import_photo:  ImageTk.PhotoImage | None = None
         self._audio_thread: threading.Thread | None = None
 
         self._build_ui()
         self._apply_styles()
+        self.after(200, self._tick)   # start music progress heartbeat
 
     # ────────────────────────────────────────────────────────────────────────
     # UI construction
@@ -210,9 +214,7 @@ class Studio(tk.Tk):
         btn_frame.pack(side="right", padx=8)
         self._btn("Connect fheroes2", self._connect_fheroes2, btn_frame, accent=True)
         self._btn("Open AGG…",        self._open_agg,         btn_frame, accent=False)
-        self._btn("Set Music Dir…",   self._set_music_dir,    btn_frame, accent=False)
-        self._btn("Save Mod…",        self._save_mod,         btn_frame, accent=False)
-        self._btn("Deploy to fheroes2", self._deploy_to_fheroes2, btn_frame, accent=True)
+        self._btn("Save Mod…",        self._save_mod,         btn_frame, accent=True)
 
         # ── status bar ──────────────────────────────────────────────────────
         self._status_var = tk.StringVar(value="No file open — use 'Open AGG…' to load HEROES2.AGG")
@@ -366,6 +368,13 @@ class Studio(tk.Tk):
                               highlightbackground=C_BORDER)
         orig.pack(side="left", fill="both", expand=True, padx=(0, 4))
 
+        # Dimensions shown large and prominently at the top
+        self._dim_label = tk.Label(orig, text="—",
+                                    bg=C_BG, fg=C_ACCENT,
+                                    font=("Courier New", 13, "bold"),
+                                    anchor="center")
+        self._dim_label.pack(fill="x", padx=8, pady=(6, 2))
+
         self._orig_canvas = tk.Canvas(orig, width=PREVIEW_SIZE, height=PREVIEW_SIZE,
                                        bg="#0d0d1a", highlightthickness=0)
         self._orig_canvas.pack(padx=8, pady=8)
@@ -447,35 +456,82 @@ class Studio(tk.Tk):
         self._nb.add(f, text="  Music  ")
         self._music_detail_tab = f
 
-        inner = tk.Frame(f, bg=C_BG)
-        inner.place(relx=0.5, rely=0.5, anchor="center")
+        # ── Track info ──────────────────────────────────────────────────────
+        info_frame = tk.Frame(f, bg=C_BG)
+        info_frame.pack(fill="x", padx=16, pady=(16, 4))
 
-        tk.Label(inner, text="🎵", bg=C_BG, fg=C_TEXT,
-                 font=("Helvetica", 48)).pack(pady=(0, 8))
-        self._music_title_label = tk.Label(inner, text="Select a track", bg=C_BG,
-                                            fg=C_TEXT, font=FONT_TITLE)
-        self._music_title_label.pack()
-        self._music_status_label = tk.Label(inner, text="", bg=C_BG,
-                                             fg=C_SUBTEXT, font=FONT_SMALL)
-        self._music_status_label.pack(pady=4)
+        tk.Label(info_frame, text="🎵", bg=C_BG, fg=C_TEXT,
+                 font=("Helvetica", 32)).pack(side="left", padx=(0, 12))
 
-        play_row = tk.Frame(inner, bg=C_BG)
-        play_row.pack(pady=8)
-        self._btn("▶  Play Installed", self._play_music_installed, play_row)
-        self._btn("▶  Play Replacement", self._play_music_replacement, play_row)
+        text_col = tk.Frame(info_frame, bg=C_BG)
+        text_col.pack(side="left", fill="x", expand=True)
+        self._music_title_label = tk.Label(text_col, text="Select a track",
+                                            bg=C_BG, fg=C_TEXT, font=FONT_TITLE,
+                                            anchor="w")
+        self._music_title_label.pack(fill="x")
+        self._music_status_label = tk.Label(text_col, text="",
+                                             bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL,
+                                             anchor="w")
+        self._music_status_label.pack(fill="x")
 
-        self._btn("Browse Audio…", self._browse_music_import, inner)
-        self._music_import_label = tk.Label(inner, text="No replacement selected",
+        ttk.Separator(f, orient="horizontal").pack(fill="x", padx=12, pady=8)
+
+        # ── Transport controls ──────────────────────────────────────────────
+        transport = tk.Frame(f, bg=C_BG)
+        transport.pack(pady=4)
+
+        self._play_btn  = self._btn("▶  Play",  self._play_music,  transport, accent=True)
+        self._pause_btn = self._btn("⏸  Pause", self._pause_music, transport)
+        self._stop_btn  = self._btn("⏹  Stop",  self._stop_music,  transport)
+
+        # ── Progress bar ────────────────────────────────────────────────────
+        prog_frame = tk.Frame(f, bg=C_BG)
+        prog_frame.pack(fill="x", padx=16, pady=8)
+
+        self._prog_time = tk.Label(prog_frame, text="0:00 / —:——",
+                                    bg=C_BG, fg=C_SUBTEXT, font=FONT_MONO,
+                                    anchor="w", width=14)
+        self._prog_time.pack(side="left")
+
+        # Canvas-based progress bar (works on all tk versions)
+        self._prog_canvas = tk.Canvas(prog_frame, bg=C_PANEL, height=8,
+                                       highlightthickness=0, bd=0)
+        self._prog_canvas.pack(side="left", fill="x", expand=True, padx=8)
+        self._prog_canvas.bind("<Button-1>", self._on_prog_click)
+
+        self._prog_fill = self._prog_canvas.create_rectangle(
+            0, 0, 0, 8, fill=C_ACCENT, outline=""
+        )
+
+        # ── File name info ──────────────────────────────────────────────────
+        self._music_names_info = tk.Label(f, text="",
+                                           bg=C_BG, fg=C_SUBTEXT,
+                                           font=FONT_MONO, justify="left")
+        self._music_names_info.pack(padx=16, pady=(0, 8), anchor="w")
+
+        ttk.Separator(f, orient="horizontal").pack(fill="x", padx=12, pady=4)
+
+        # ── Replace section ─────────────────────────────────────────────────
+        rep = tk.Frame(f, bg=C_BG)
+        rep.pack(fill="x", padx=16, pady=8)
+
+        tk.Label(rep, text="Replace track:", bg=C_BG, fg=C_SUBTEXT,
+                 font=FONT_SMALL).pack(anchor="w")
+        self._music_import_label = tk.Label(rep, text="No replacement selected",
                                              bg=C_BG, fg=C_SUBTEXT, font=FONT_SMALL)
-        self._music_import_label.pack(pady=4)
-        self._btn("Stage Music Replacement", self._apply_music, inner, accent=True)
+        self._music_import_label.pack(anchor="w", pady=2)
+
+        rep_btn = tk.Frame(rep, bg=C_BG)
+        rep_btn.pack(anchor="w", pady=4)
+        self._btn("Browse Audio…",       self._browse_music_import, rep_btn)
+        self._btn("★ Stage Replacement", self._apply_music,         rep_btn, accent=True)
 
         self._music_replacement_path: str = ""
 
-        self._music_names_info = tk.Label(inner, text="",
-                                           bg=C_BG, fg=C_SUBTEXT,
-                                           font=FONT_MONO, justify="left")
-        self._music_names_info.pack(pady=(12, 0))
+        # Internal state for the player
+        self._music_playing  = False
+        self._music_paused   = False
+        self._music_duration = 0.0   # seconds; 0 = unknown
 
     def _build_info_tab(self) -> None:
         f = tk.Frame(self._nb, bg=C_BG)
@@ -804,6 +860,12 @@ class Studio(tk.Tk):
         self._sel_sprite_idx = idx
         hdr = headers[idx]
         self._frame_label.config(text=f"Frame {idx + 1} / {n}")
+
+        mono_flag = "  [MONO]" if hdr.animationFrames & 0x20 else ""
+        self._dim_label.config(
+            text=f"{hdr.width} × {hdr.height} px{mono_flag}  |  "
+                 f"offset ({hdr.offsetX:+d}, {hdr.offsetY:+d})"
+        )
         self._sprite_info.config(
             text=f"Size: {hdr.width} × {hdr.height}\n"
                  f"Offset: ({hdr.offsetX}, {hdr.offsetY})\n"
@@ -1030,23 +1092,24 @@ class Studio(tk.Tk):
             status = f"✓ Installed: {os.path.basename(mt.installed_path)}"
             fg = C_TEXT
         else:
-            status = "Not installed (no matching file in music folder)"
+            status = "Not installed — no matching file found in music folder"
             fg = C_SUBTEXT
         self._music_status_label.config(text=status, fg=fg)
         self._music_replacement_path = mt.replacement_path if mt.replaced else ""
-        label = (os.path.basename(mt.replacement_path)
-                 if mt.replaced else "No replacement selected")
-        self._music_import_label.config(text=label)
-
+        self._music_import_label.config(
+            text=(os.path.basename(mt.replacement_path) if mt.replaced
+                  else "No replacement selected")
+        )
         names = "\n".join([
-            f"MAPPED:      {mt.track.mapped_name()}",
-            f"DOS/GOG:     {mt.track.dos_name()}",
-            f"Win/Track:   {mt.track.win_name()}",
+            f"MAPPED:    {mt.track.mapped_name()}",
+            f"DOS/GOG:   {mt.track.dos_name()}",
+            f"Win/CD:    {mt.track.win_name()}",
         ])
         self._music_names_info.config(text=names)
-
         self._detail_title.config(text=f"🎵  {mt.track.friendly_name}")
         self._detail_sub.config(text=f"Track {mt.track.track_id}  ·  {mt.track.enum_name}")
+        # Reset progress display for the new track
+        self._update_progress_display(0.0)
 
     def _browse_music_import(self) -> None:
         path = filedialog.askopenfilename(
@@ -1082,6 +1145,43 @@ class Studio(tk.Tk):
         else:
             self._log("No replacement selected")
 
+    # New unified transport methods ──────────────────────────────────────────
+
+    def _play_music(self) -> None:
+        """Play the currently selected track (installed file preferred)."""
+        if not self._sel_music:
+            return
+        path = (self._sel_music.installed_path or
+                (self._sel_music.replacement_path if self._sel_music.replaced else ""))
+        if not path:
+            self._log("No installed file for this track")
+            return
+        if self._music_paused and _AUDIO_OK:
+            pygame.mixer.music.unpause()
+            self._music_paused   = False
+            self._music_playing  = True
+            return
+        self._play_audio_file(path)
+
+    def _pause_music(self) -> None:
+        if not _AUDIO_OK:
+            return
+        if self._music_playing and not self._music_paused:
+            pygame.mixer.music.pause()
+            self._music_paused  = True
+            self._music_playing = False
+        elif self._music_paused:
+            pygame.mixer.music.unpause()
+            self._music_paused  = False
+            self._music_playing = True
+
+    def _stop_music(self) -> None:
+        if _AUDIO_OK:
+            pygame.mixer.music.stop()
+        self._music_playing = False
+        self._music_paused  = False
+        self._update_progress_display(0.0)
+
     def _play_audio_file(self, path: str) -> None:
         if not _AUDIO_OK:
             messagebox.showinfo("Audio unavailable", "pygame.mixer failed to initialise.")
@@ -1089,8 +1189,55 @@ class Studio(tk.Tk):
         try:
             pygame.mixer.music.load(path)
             pygame.mixer.music.play()
+            self._music_playing = True
+            self._music_paused  = False
+            # Try to find duration via a temporary Sound object (works for short files)
+            try:
+                tmp = pygame.mixer.Sound(path)
+                self._music_duration = tmp.get_length()
+                del tmp
+            except Exception:
+                self._music_duration = 0.0
         except Exception as e:
             self._log(f"Playback error: {e}")
+
+    def _on_prog_click(self, event: tk.Event) -> None:
+        """Seek to the clicked position on the progress bar (requires duration)."""
+        if not _AUDIO_OK or not self._music_playing and not self._music_paused:
+            return
+        if self._music_duration <= 0:
+            return
+        w = self._prog_canvas.winfo_width()
+        if w <= 0:
+            return
+        frac = max(0.0, min(event.x / w, 1.0))
+        target_s = frac * self._music_duration
+        pygame.mixer.music.set_pos(target_s)
+
+    def _update_progress_display(self, elapsed: float) -> None:
+        dur = self._music_duration
+        e_str = f"{int(elapsed//60)}:{int(elapsed%60):02d}"
+        d_str = (f"{int(dur//60)}:{int(dur%60):02d}" if dur > 0 else "—:——")
+        self._prog_time.config(text=f"{e_str} / {d_str}")
+        w = self._prog_canvas.winfo_width()
+        if w > 0 and dur > 0:
+            fill_w = int(w * min(elapsed / dur, 1.0))
+            self._prog_canvas.coords(self._prog_fill, 0, 0, fill_w, 8)
+
+    def _tick(self) -> None:
+        """200 ms heartbeat: update music progress bar."""
+        if _AUDIO_OK and self._music_playing:
+            if pygame.mixer.music.get_busy():
+                ms = pygame.mixer.music.get_pos()
+                if ms >= 0:
+                    self._update_progress_display(ms / 1000.0)
+            else:
+                # Track finished naturally
+                self._music_playing = False
+                self._music_paused  = False
+                dur = self._music_duration
+                self._update_progress_display(dur if dur > 0 else 0.0)
+        self.after(200, self._tick)
 
     # ────────────────────────────────────────────────────────────────────────
     # Helpers
