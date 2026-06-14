@@ -30,7 +30,7 @@ from fh2agg.sound import m82_to_wav_bytes, wav_bytes_to_m82      # noqa: E402
 # ── optional pygame for audio playback ─────────────────────────────────────
 try:
     import pygame
-    pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
+    pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=4096)
     _AUDIO_OK = True
 except Exception:
     _AUDIO_OK = False
@@ -57,6 +57,75 @@ CHECKER_DARK  = (100, 100, 120)
 CHECKER_LIGHT = (140, 140, 160)
 CHECKER_SIZE  = 8
 PREVIEW_SIZE  = 256      # preview panel size in pixels
+
+# ── fheroes2 install auto-detection ────────────────────────────────────────
+
+def _fheroes2_candidates() -> list[str]:
+    """Return an ordered list of directories where fheroes2 might be installed."""
+    import platform
+    dirs: list[str] = []
+    sys_name = platform.system()
+
+    if sys_name == "Windows":
+        for env in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+            base = os.environ.get(env, "")
+            if base:
+                dirs.append(os.path.join(base, "fheroes2"))
+        appdata = os.environ.get("LOCALAPPDATA", "")
+        if appdata:
+            dirs.append(os.path.join(appdata, "fheroes2"))
+        # GOG / Steam installs
+        for env in ("ProgramFiles", "ProgramFiles(x86)"):
+            base = os.environ.get(env, "")
+            if base:
+                dirs.append(os.path.join(base, "GOG Games", "HoMM 2 Gold", "fheroes2"))
+                dirs.append(os.path.join(base, "Steam", "steamapps", "common", "fheroes2"))
+    elif sys_name == "Darwin":
+        dirs += [
+            os.path.expanduser("~/Library/Application Support/fheroes2"),
+            "/Applications/fheroes2.app/Contents/Resources",
+        ]
+    else:  # Linux / BSD / etc.
+        dirs += [
+            os.path.expanduser("~/.local/share/fheroes2"),
+            "/usr/local/share/fheroes2",
+            "/usr/share/fheroes2",
+            "/opt/fheroes2",
+        ]
+
+    # Also check next to the studio script itself (portable layout)
+    dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    return dirs
+
+
+def _find_fheroes2_dir() -> str | None:
+    """Return the first fheroes2 install directory that contains data/HEROES2.AGG, or None."""
+    for d in _fheroes2_candidates():
+        if os.path.isfile(os.path.join(d, "data", "HEROES2.AGG")):
+            return d
+    return None
+
+
+def _music_dir_for_agg(agg_path: str) -> str:
+    """Find the music directory for a given AGG path.
+
+    Checks (in order):
+      1. <agg_dir>/music/          — when AGG is at the install root
+      2. <parent_of_agg_dir>/music/ — when AGG is inside a data/ sub-folder (fheroes2 layout)
+      3. <agg_dir>/Music/          — case-variant
+      4. <parent_of_agg_dir>/Music/
+    """
+    agg_dir = os.path.dirname(agg_path)
+    parent   = os.path.dirname(agg_dir)
+    for candidate in (
+        os.path.join(agg_dir, "music"),
+        os.path.join(parent,  "music"),
+        os.path.join(agg_dir, "Music"),
+        os.path.join(parent,  "Music"),
+    ):
+        if os.path.isdir(candidate):
+            return candidate
+    return ""
 
 
 def _checker_bg(size: int) -> Image.Image:
@@ -113,6 +182,7 @@ class Studio(tk.Tk):
         self.minsize(960, 640)
 
         self.project = Project()
+        self._fheroes2_dir: str = ""   # set by _connect_fheroes2 or _open_agg
         self._sel_asset = None          # currently selected AssetEntry
         self._sel_music = None          # currently selected MusicEntry
         self._sel_sprite_idx = 0        # sprite frame index within ICN
@@ -138,9 +208,11 @@ class Studio(tk.Tk):
 
         btn_frame = tk.Frame(top, bg=C_ACCENT2)
         btn_frame.pack(side="right", padx=8)
-        self._btn("Open AGG…",    self._open_agg,   btn_frame, accent=False)
-        self._btn("Set Music Dir…",self._set_music_dir, btn_frame, accent=False)
-        self._btn("Save Mod…",    self._save_mod,   btn_frame, accent=True)
+        self._btn("Connect fheroes2", self._connect_fheroes2, btn_frame, accent=True)
+        self._btn("Open AGG…",        self._open_agg,         btn_frame, accent=False)
+        self._btn("Set Music Dir…",   self._set_music_dir,    btn_frame, accent=False)
+        self._btn("Save Mod…",        self._save_mod,         btn_frame, accent=False)
+        self._btn("Deploy to fheroes2", self._deploy_to_fheroes2, btn_frame, accent=True)
 
         # ── status bar ──────────────────────────────────────────────────────
         self._status_var = tk.StringVar(value="No file open — use 'Open AGG…' to load HEROES2.AGG")
@@ -444,10 +516,12 @@ class Studio(tk.Tk):
         )
         if not path:
             return
-        # Guess music dir: same folder / music subfolder
-        music_dir = os.path.join(os.path.dirname(path), "music")
-        if not os.path.isdir(music_dir):
-            music_dir = ""
+        # Detect music dir relative to the AGG (handles both flat and data/ layouts)
+        music_dir = _music_dir_for_agg(path)
+        # If AGG lives inside a data/ folder, the parent might be the fheroes2 root
+        parent = os.path.dirname(os.path.dirname(path))
+        if os.path.isfile(os.path.join(parent, "data", "HEROES2.AGG")):
+            self._fheroes2_dir = parent
         try:
             self.project.open(path, music_dir=music_dir)
         except AggFormatError as e:
@@ -459,6 +533,10 @@ class Studio(tk.Tk):
 
         self._log(f"Opened {path}")
         self._log(f"  {len(self.project.assets)} assets indexed")
+        if music_dir:
+            self._log(f"  Music dir: {music_dir}")
+        else:
+            self._log("  No music folder found — use 'Set Music Dir…' to locate it")
         self._status_var.set(f"{os.path.basename(path)}  —  {len(self.project.assets)} assets")
         self._populate_browser()
 
@@ -472,6 +550,117 @@ class Studio(tk.Tk):
             self._populate_music_list()
             self._log(f"Music dir: {d}")
         self._status_var.set(f"Music folder: {d}")
+
+    def _connect_fheroes2(self) -> None:
+        """Auto-detect (or let the user browse for) a fheroes2 install dir,
+        then open its HEROES2.AGG and point the music dir at its music/ folder."""
+        found = _find_fheroes2_dir()
+        if found:
+            use = messagebox.askyesno(
+                "fheroes2 found",
+                f"Found fheroes2 install at:\n{found}\n\nLoad data from here?"
+            )
+            if not use:
+                found = None
+
+        if not found:
+            found = filedialog.askdirectory(
+                title="Select fheroes2 install folder (the one that contains 'data' and 'music')"
+            )
+            if not found:
+                return
+            agg_check = os.path.join(found, "data", "HEROES2.AGG")
+            if not os.path.isfile(agg_check):
+                messagebox.showerror(
+                    "Not found",
+                    f"Could not find data/HEROES2.AGG inside:\n{found}"
+                )
+                return
+
+        self._fheroes2_dir = found
+        agg_path  = os.path.join(found, "data", "HEROES2.AGG")
+        music_dir = _music_dir_for_agg(agg_path)
+
+        try:
+            self.project.open(agg_path, music_dir=music_dir)
+        except AggFormatError as e:
+            messagebox.showerror("Cannot open AGG", str(e))
+            return
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+
+        self._log(f"Connected to fheroes2: {found}")
+        self._log(f"  Opened {agg_path}")
+        self._log(f"  {len(self.project.assets)} assets indexed")
+        if music_dir:
+            self._log(f"  Music dir: {music_dir}")
+        else:
+            self._log("  No music/ folder found inside the install — use 'Set Music Dir…'")
+        self._status_var.set(
+            f"fheroes2: {os.path.basename(found)}  —  {len(self.project.assets)} assets"
+        )
+        self._populate_browser()
+
+    def _deploy_to_fheroes2(self) -> None:
+        """Write the patched AGG (and music replacements) directly into the
+        connected fheroes2 install, after making a one-time backup."""
+        if not self.project.is_open():
+            messagebox.showinfo("Nothing to deploy", "Open or connect an AGG file first.")
+            return
+        if not self.project.has_pending_changes:
+            messagebox.showinfo("Nothing to deploy", "No pending changes staged yet.")
+            return
+
+        # Resolve target install dir
+        if not self._fheroes2_dir:
+            found = _find_fheroes2_dir()
+            if found:
+                use = messagebox.askyesno(
+                    "Deploy target",
+                    f"Deploy to fheroes2 install at:\n{found}?"
+                )
+                self._fheroes2_dir = found if use else ""
+            if not self._fheroes2_dir:
+                self._fheroes2_dir = filedialog.askdirectory(
+                    title="Select fheroes2 install folder to deploy into"
+                ) or ""
+            if not self._fheroes2_dir:
+                return
+
+        data_dir  = os.path.join(self._fheroes2_dir, "data")
+        music_dir = _music_dir_for_agg(os.path.join(data_dir, "HEROES2.AGG")) or \
+                    os.path.join(self._fheroes2_dir, "music")
+        target_agg = os.path.join(data_dir, "HEROES2.AGG")
+        backup_agg = os.path.join(data_dir, "HEROES2.AGG.bak")
+
+        # Confirm with the user
+        if not messagebox.askyesno(
+            "Confirm deploy",
+            f"This will overwrite:\n{target_agg}\n\n"
+            f"A backup will be saved as HEROES2.AGG.bak (only on first deploy).\n\n"
+            "Continue?"
+        ):
+            return
+
+        # Create backup only if it doesn't already exist
+        import shutil
+        if not os.path.isfile(backup_agg) and os.path.isfile(target_agg):
+            shutil.copy2(target_agg, backup_agg)
+            self._log(f"Backup: {backup_agg}")
+
+        try:
+            lines = self.project.save(target_agg, music_out_dir=music_dir)
+        except Exception as e:
+            messagebox.showerror("Deploy failed", str(e))
+            return
+        for line in lines:
+            self._log(line)
+        messagebox.showinfo(
+            "Deployed",
+            f"Changes written to:\n{target_agg}\n"
+            f"Music → {music_dir}"
+        )
 
     def _save_mod(self) -> None:
         if not self.project.is_open():
@@ -626,9 +815,12 @@ class Studio(tk.Tk):
                 rgba, _ = sprite_to_images(image, transform, hdr.width, hdr.height,
                                            self.project.palette)
                 display = _composite_on_checker(rgba)
-            except Exception:
+            except Exception as e:
+                self._log(f"Sprite render error (frame {idx}): {e}")
                 display = Image.new("RGB", (PREVIEW_SIZE, PREVIEW_SIZE), (30, 0, 50))
         else:
+            if not self.project.palette:
+                self._log("No palette loaded — open an AGG that contains KB.PAL to render sprites")
             display = Image.new("RGB", (PREVIEW_SIZE, PREVIEW_SIZE), (30, 0, 50))
 
         photo = ImageTk.PhotoImage(display)
@@ -894,13 +1086,11 @@ class Studio(tk.Tk):
         if not _AUDIO_OK:
             messagebox.showinfo("Audio unavailable", "pygame.mixer failed to initialise.")
             return
-        def _play():
-            try:
-                pygame.mixer.music.load(path)
-                pygame.mixer.music.play()
-            except Exception as e:
-                self._log(f"Playback error: {e}")
-        threading.Thread(target=_play, daemon=True).start()
+        try:
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.play()
+        except Exception as e:
+            self._log(f"Playback error: {e}")
 
     # ────────────────────────────────────────────────────────────────────────
     # Helpers

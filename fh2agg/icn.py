@@ -120,12 +120,19 @@ def parse_icn(blob: bytes) -> tuple[list[ICNHeader], list[bytes]]:
 
     data_start = TOP_HEADER_SIZE + count * ICN_HEADER_SIZE
 
+    # How many bytes of sprite data are actually present in the blob.
+    # blockSize from the ICN header CAN exceed this in original HOMM2 files
+    # (the stored AGG entry is sometimes shorter than blockSize claims).
+    # We always clamp to what is physically available.
+    available_data = len(blob) - data_start
+
     sprite_data: list[bytes] = []
     for i, hdr in enumerate(headers):
         if i + 1 != count:
             data_size = headers[i + 1].offsetData - hdr.offsetData
         else:
-            data_size = block_size - hdr.offsetData
+            # Last sprite: use whichever is smaller — blockSize or actual bytes present.
+            data_size = min(block_size, available_data) - hdr.offsetData
 
         start = data_start + hdr.offsetData
         end = start + data_size
