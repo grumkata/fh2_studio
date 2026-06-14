@@ -284,19 +284,11 @@ def decode_sprite(data: bytes, header: ICNHeader) -> tuple[bytearray, bytearray]
             posX += count
             pos += consumed
 
-        else:  # 0xC1 - 0xFF
-            if b == 0xC1:
-                if pos + 2 >= n:
-                    break
-                count = data[pos + 1]
-                color = data[pos + 2]
-                consumed = 3
-            else:
-                count = b - 0xC0
-                if pos + 1 >= n:
-                    break
-                color = data[pos + 1]
-                consumed = 2
+        else:  # 0xC1–0xFF: RLE fill — count = b − 0xC0, next byte is the color
+            count = b - 0xC0
+            if pos + 1 >= n:
+                break
+            color = data[pos + 1]
 
             for k in range(count):
                 idx = row_start + posX + k
@@ -305,7 +297,7 @@ def decode_sprite(data: bytes, header: ICNHeader) -> tuple[bytearray, bytearray]
                     transform[idx] = 0
 
             posX += count
-            pos += consumed
+            pos  += 2
 
     return image, transform
 
@@ -346,10 +338,10 @@ def encode_sprite(image: bytes, transform: bytes, width: int, height: int) -> by
             elif t == 0:
                 color = image[base + x]
                 run = 1
-                while x + run < width and transform[base + x + run] == 0 and image[base + x + run] == color and run < 255:
+                while x + run < width and transform[base + x + run] == 0 and image[base + x + run] == color and run < 63:
                     run += 1
                 if run >= 2:
-                    out += bytes((0xC1, run, color))
+                    out += bytes((0xC0 + run, color))
                     x += run
                 else:
                     out += bytes((0x01, color))
@@ -438,15 +430,14 @@ def _selftest() -> None:
     width, height = 6, 2
     raw = bytes(
         [
-            0x02, 0x05, 0x06,  # row0: 2 raw pixels, colors 5,6
-            0xC1, 0x03, 0x07,  # row0: 3 pixels of color 7  -> total 5 so far
+            0x02, 0x05, 0x06,  # row0: 2 raw pixels, colors 5, 6
+            0xC3, 0x07,        # row0: RLE 3 pixels of color 7 (0xC3-0xC0=3, standard 2-byte)
             0x81,              # row0: 1 transparent pixel  -> total 6 = width, row done
             0x00,              # end of row 0
-            0xC2,              # row1: (0xC2-0xC0)=2 pixels
-            0x09,              # ... of color 9
+            0xC2, 0x09,        # row1: 2 pixels of color 9  (0xC2-0xC0=2, standard 2-byte)
             0xC0, 0x44,        # row1: transformValue=0x44 -> countValue=0, 0x40 set
-            0x02,              # ... count byte = 2 -> transformType=((0x44&0x3C)>>2)+2=((0x04)>>2)+2=1+2=3
-            0x83,              # row1: (0x83-0x80)=3 transparent pixels but only 2 remain (6 width: 2+2+2=6)
+            0x02,              # ... count byte = 2 -> transformType=((0x44&0x3C)>>2)+2=3
+            0x83,              # row1: (0x83-0x80)=3 transparent but only 2 remain
             0x80,              # end of image
         ]
     )
