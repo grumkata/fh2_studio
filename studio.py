@@ -152,6 +152,31 @@ def _composite_on_checker(rgba: Image.Image, max_size: int = PREVIEW_SIZE) -> Im
     return bg
 
 
+def _composite_on_solid(rgba: Image.Image, color: str,
+                        max_size: int = PREVIEW_SIZE) -> Image.Image:
+    """Scale RGBA to fit max_size×max_size and composite on a solid colour background.
+
+    ``color`` may be ``'black'``, ``'white'``, ``'green'`` (terrain-like), or any
+    PIL colour string.
+    """
+    bg_colours = {
+        "black": (0, 0, 0),
+        "white": (255, 255, 255),
+        "green": (82, 154, 76),   # typical HOMM2 grass colour
+    }
+    rgb = bg_colours.get(color, (0, 0, 0))
+    w, h = rgba.size
+    scale = min(max_size / max(w, 1), max_size / max(h, 1), 8.0)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    scaled = rgba.resize((new_w, new_h), Image.NEAREST)
+    bg = Image.new("RGB", (max_size, max_size), rgb)
+    ox = (max_size - new_w) // 2
+    oy = (max_size - new_h) // 2
+    bg.paste(scaled, (ox, oy), scaled)
+    return bg
+
+
 def _fit_user_image(user_rgba: Image.Image, target_w: int, target_h: int) -> Image.Image:
     """Scale user image to target dimensions using high-quality resampling,
     preserving aspect ratio with transparent padding."""
@@ -189,6 +214,7 @@ class Studio(tk.Tk):
         self._sel_asset = None
         self._sel_music = None
         self._sel_sprite_idx = 0
+        self._bg_mode        = "checker"   # cycles: checker → black → white → green
         self._preview_photo: ImageTk.PhotoImage | None = None
         self._import_photo:  ImageTk.PhotoImage | None = None
         self._audio_thread: threading.Thread | None = None
@@ -394,7 +420,10 @@ class Studio(tk.Tk):
 
         self._sprite_info = tk.Label(orig, text="", bg=C_BG, fg=C_SUBTEXT,
                                       font=FONT_MONO, justify="left")
-        self._sprite_info.pack(padx=8, pady=(0, 8), anchor="w")
+        self._sprite_info.pack(padx=8, pady=(0, 4), anchor="w")
+
+        self._btn("Export frame as PNG…", self._export_sprite_png, orig)
+        self._bg_btn = self._btn("BG: Checker", self._cycle_bg, orig)
 
         # --- Import / replace side ---
         imp = tk.LabelFrame(cols, text=" Replace With ", bg=C_BG, fg=C_SUBTEXT,
@@ -873,22 +902,67 @@ class Studio(tk.Tk):
 
         if self.project.palette and hdr.width > 0 and hdr.height > 0:
             try:
-                image, transform = decode_sprite(datas[idx], hdr)
+                sprite_bytes = datas[idx]
+                image, transform = decode_sprite(sprite_bytes, hdr)
+
+                # --- Diagnostic logging ---
+                n_opaque      = sum(1 for t in transform if t == 0)
+                n_transparent = sum(1 for t in transform if t == 1)
+                n_special     = sum(1 for t in transform if t > 1)
+                total         = hdr.width * hdr.height
+                hex_preview   = sprite_bytes[:48].hex(" ") if sprite_bytes else "(empty)"
+                self._log(
+                    f"  {hdr.width}×{hdr.height}  data={len(sprite_bytes)}B  "
+                    f"opaque={n_opaque}  transp={n_transparent}  special={n_special}  "
+                    f"offsetData={hdr.offsetData}"
+                )
+                self._log(f"  bytes[0:48]={hex_preview}")
+                # Per-row transparent count — shows WHERE the transparency is
+                row_summary = []
+                for row in range(hdr.height):
+                    base = row * hdr.width
+                    t_count = sum(1 for x in range(hdr.width) if transform[base + x] == 1)
+                    row_summary.append(t_count)
+                # Only log rows that have ANY transparency
+                for row, tc in enumerate(row_summary):
+                    if tc > 0:
+                        self._log(f"    row {row:3d}: {tc:3d} transparent / {hdr.width}")
+                # --------------------------
+
                 rgba, _ = sprite_to_images(image, transform, hdr.width, hdr.height,
                                            self.project.palette)
-                display = _composite_on_checker(rgba)
+                display = _composite_on_checker(rgba) if self._bg_mode == "checker" \
+                    else _composite_on_solid(rgba, self._bg_mode)
+                self._last_rgba = rgba
             except Exception as e:
                 self._log(f"Sprite render error (frame {idx}): {e}")
+                import traceback; self._log(traceback.format_exc())
                 display = Image.new("RGB", (PREVIEW_SIZE, PREVIEW_SIZE), (30, 0, 50))
+                self._last_rgba = None
         else:
             if not self.project.palette:
-                self._log("No palette loaded — open an AGG that contains KB.PAL to render sprites")
+                self._log("No palette loaded — open an AGG that contains KB.PAL")
             display = Image.new("RGB", (PREVIEW_SIZE, PREVIEW_SIZE), (30, 0, 50))
+            self._last_rgba = None
 
         photo = ImageTk.PhotoImage(display)
         self._orig_canvas.delete("all")
         self._orig_canvas.create_image(0, 0, anchor="nw", image=photo)
         self._preview_photo = photo  # keep reference
+
+    def _cycle_bg(self) -> None:
+        """Cycle the preview background: checker → black → white → green → checker."""
+        order = ["checker", "black", "white", "green"]
+        labels = {
+            "checker": "BG: Checker",
+            "black":   "BG: Black",
+            "white":   "BG: White",
+            "green":   "BG: Green (terrain)",
+        }
+        idx = order.index(self._bg_mode)
+        self._bg_mode = order[(idx + 1) % len(order)]
+        self._bg_btn.config(text=labels[self._bg_mode])
+        self._show_sprite_frame()   # re-render with new background
 
     def _prev_sprite(self) -> None:
         if not getattr(self, "_icn_headers", []):
@@ -901,6 +975,30 @@ class Studio(tk.Tk):
             return
         self._sel_sprite_idx = (self._sel_sprite_idx + 1) % len(self._icn_headers)
         self._show_sprite_frame()
+
+    def _export_sprite_png(self) -> None:
+        """Save the current sprite frame as a full-resolution RGBA PNG."""
+        rgba = getattr(self, "_last_rgba", None)
+        if rgba is None:
+            messagebox.showinfo("Nothing to export", "Select a sprite frame first.")
+            return
+        asset = self._sel_asset
+        name = asset.name.replace(".", "_") if asset else "sprite"
+        idx  = self._sel_sprite_idx
+        default = f"{name}_frame{idx}.png"
+        path = filedialog.asksaveasfilename(
+            title="Export frame as PNG",
+            defaultextension=".png",
+            initialfile=default,
+            filetypes=[("PNG images", "*.png"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            rgba.save(path)
+            self._log(f"Exported {rgba.width}×{rgba.height} PNG → {path}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
 
     def _update_info_sprite(self, asset) -> None:
         raw = self.project.raw_bytes(asset.name)

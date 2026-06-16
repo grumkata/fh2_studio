@@ -107,11 +107,17 @@ class ICNHeader:
 def parse_icn(blob: bytes) -> tuple[list[ICNHeader], list[bytes]]:
     """Split a raw ICN blob into (headers, per-sprite RLE byte strings).
 
-    Lenient by design: original HOMM2 AGG files routinely have blockSize values
-    larger than the bytes actually stored, and offsetData sequences that extend
-    past the available data.  We clamp everything silently rather than raising,
-    returning an empty bytes object for any sprite whose data cannot be read.
-    Only raises IcnFormatError when the blob is too small for the top-level header.
+    Mirrors fheroes2's readIcnFromAgg() exactly:
+        data = body.data() + headerSize + header1.offsetData
+        dataEnd = data + dataSize
+    where headerSize is the constant 6 (uint16 count + uint32 blockSize).
+    offsetData is measured from byte 6 — i.e. it already accounts for the
+    sprite header table, so sprite 0's offsetData equals count*ICN_HEADER_SIZE,
+    NOT 0. This is confirmed directly against fheroes2's engine source.
+
+    Lenient by design: clamps out-of-range data instead of raising, so a
+    truncated/corrupt AGG doesn't crash the whole tool. Only raises
+    IcnFormatError when the blob is too small for the top-level header.
     """
     if len(blob) < TOP_HEADER_SIZE:
         raise IcnFormatError("blob too small to be an ICN container")
@@ -127,27 +133,25 @@ def parse_icn(blob: bytes) -> tuple[list[ICNHeader], list[bytes]]:
         headers.append(ICNHeader.unpack(blob, off))
 
     actual_count = len(headers)
-    data_start   = TOP_HEADER_SIZE + actual_count * ICN_HEADER_SIZE
 
-    # How many data bytes are physically present (blockSize often exceeds this).
-    available = max(0, len(blob) - data_start)
+    # Bytes available AFTER the 6-byte top header (this is the space that
+    # offsetData / blockSize are measured within — includes the header table).
+    available = max(0, len(blob) - TOP_HEADER_SIZE)
 
     sprite_data: list[bytes] = []
     for i, hdr in enumerate(headers):
-        # Clamp the start offset so it never exceeds available bytes.
         s_off = min(max(hdr.offsetData, 0), available)
 
         if i + 1 < actual_count:
-            # Between sprites: end = next sprite's start offset.
             e_off = min(max(headers[i + 1].offsetData, 0), available)
         else:
-            # Last sprite: use blockSize, clamped to what is actually present.
             e_off = min(max(block_size, 0), available)
 
-        # Guard against inverted ranges from corrupt offsetData ordering.
-        e_off = max(s_off, e_off)
+        e_off = max(s_off, e_off)   # guard against inverted/corrupt ordering
 
-        sprite_data.append(blob[data_start + s_off : data_start + e_off])
+        # Base is TOP_HEADER_SIZE (byte 6), exactly like fheroes2's
+        # `body.data() + headerSize + header1.offsetData`.
+        sprite_data.append(blob[TOP_HEADER_SIZE + s_off : TOP_HEADER_SIZE + e_off])
 
     return headers, sprite_data
 
@@ -166,13 +170,18 @@ def build_icn(headers: list[ICNHeader], sprite_data: list[bytes]) -> bytes:
     out = bytearray()
 
     new_headers = []
-    running_offset = 0
+    # offsetData is measured from byte 6 (TOP_HEADER_SIZE), and since our
+    # physical layout is [6-byte header][header table][sprite data...],
+    # sprite 0's data starts right after the header table — so its
+    # offsetData must equal count * ICN_HEADER_SIZE, not 0.
+    running_offset = count * ICN_HEADER_SIZE
     for hdr, data in zip(headers, sprite_data):
         new_headers.append(
             ICNHeader(hdr.offsetX, hdr.offsetY, hdr.width, hdr.height, hdr.animationFrames, running_offset)
         )
         running_offset += len(data)
 
+    # blockSize is also measured from byte 6, so it equals the offset just past the last byte.
     block_size = running_offset
 
     out += struct.pack("<HI", count, block_size)
@@ -284,11 +293,21 @@ def decode_sprite(data: bytes, header: ICNHeader) -> tuple[bytearray, bytearray]
             posX += count
             pos += consumed
 
-        else:  # 0xC1–0xFF: RLE fill — count = b − 0xC0, next byte is the color
-            count = b - 0xC0
-            if pos + 1 >= n:
-                break
-            color = data[pos + 1]
+        else:  # 0xC1–0xFF: RLE fill
+            # 0xC1: next byte is the pixel COUNT, byte after is the COLOR (3-byte form)
+            # 0xC2-0xFF: count = opcode - 0xC0 (1-63), next byte is the COLOR (2-byte form)
+            if b == 0xC1:
+                if pos + 2 >= n:
+                    break
+                count = data[pos + 1]
+                color = data[pos + 2]
+                consumed = 3
+            else:
+                count = b - 0xC0
+                if pos + 1 >= n:
+                    break
+                color = data[pos + 1]
+                consumed = 2
 
             for k in range(count):
                 idx = row_start + posX + k
@@ -297,7 +316,7 @@ def decode_sprite(data: bytes, header: ICNHeader) -> tuple[bytearray, bytearray]
                     transform[idx] = 0
 
             posX += count
-            pos  += 2
+            pos  += consumed
 
     return image, transform
 
@@ -338,10 +357,10 @@ def encode_sprite(image: bytes, transform: bytes, width: int, height: int) -> by
             elif t == 0:
                 color = image[base + x]
                 run = 1
-                while x + run < width and transform[base + x + run] == 0 and image[base + x + run] == color and run < 63:
+                while x + run < width and transform[base + x + run] == 0 and image[base + x + run] == color and run < 255:
                     run += 1
                 if run >= 2:
-                    out += bytes((0xC0 + run, color))
+                    out += bytes((0xC1, run, color))
                     x += run
                 else:
                     out += bytes((0x01, color))
@@ -431,10 +450,10 @@ def _selftest() -> None:
     raw = bytes(
         [
             0x02, 0x05, 0x06,  # row0: 2 raw pixels, colors 5, 6
-            0xC3, 0x07,        # row0: RLE 3 pixels of color 7 (0xC3-0xC0=3, standard 2-byte)
+            0xC1, 0x03, 0x07,  # row0: 0xC1 form: count=3, color=7 → 3 pixels of color 7
             0x81,              # row0: 1 transparent pixel  -> total 6 = width, row done
             0x00,              # end of row 0
-            0xC2, 0x09,        # row1: 2 pixels of color 9  (0xC2-0xC0=2, standard 2-byte)
+            0xC2, 0x09,        # row1: 2 pixels of color 9 (0xC2-0xC0=2, standard 2-byte)
             0xC0, 0x44,        # row1: transformValue=0x44 -> countValue=0, 0x40 set
             0x02,              # ... count byte = 2 -> transformType=((0x44&0x3C)>>2)+2=3
             0x83,              # row1: (0x83-0x80)=3 transparent but only 2 remain
@@ -489,7 +508,8 @@ def _selftest() -> None:
     headers2, datas2 = parse_icn(blob2)
     assert datas2[0] == big
     assert datas2[1] == datas[1]
-    assert headers2[1].offsetData == len(big)
+    assert headers2[1].offsetData == 2 * ICN_HEADER_SIZE + len(big), \
+        f"expected offsetData={2 * ICN_HEADER_SIZE + len(big)}, got {headers2[1].offsetData}"
 
     print("icn: sprite RLE round-trip + opcode decode + container round-trip OK")
 
