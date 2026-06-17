@@ -14,10 +14,14 @@ becomes the foundation of a larger modding engine.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import tempfile
+import zipfile
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum, auto
 from typing import Callable, ClassVar
 
@@ -176,6 +180,152 @@ class Project:
             return True
         return any(mt.replaced for mt in self.music_tracks)
 
+    @property
+    def has_pending_agg_changes(self) -> bool:
+        """True if any sprite/sound (AGG-packed) replacement is staged.
+
+        Distinct from ``has_pending_changes``, which also counts staged
+        music replacements — those never go into an AGG at all (music is
+        loose files on disk), so callers building a HEROES2X.AGG overlay
+        need this narrower check.
+        """
+        return bool(self._pending)
+
+    def build_overlay_bytes(self, existing_entries: "OrderedDict[str, bytes] | None" = None) -> bytes:
+        """Build raw AGG bytes for a minimal HEROES2X.AGG-style overlay.
+
+        Contains ONLY this project's pending sprite/sound replacements,
+        merged on top of ``existing_entries`` (e.g. the current contents of
+        a real Price of Loyalty heroes2x.agg, or a previous fh2_studio
+        overlay) so nothing already present is lost. If ``existing_entries``
+        is None, the result contains just the pending replacements — no
+        original-game data is duplicated into it.
+        """
+        merged: "OrderedDict[str, bytes]" = OrderedDict(existing_entries) if existing_entries else OrderedDict()
+        for name, data in self._pending.items():
+            merged[name] = data
+        return build_agg(merged.items())
+
+    # ------------------------------------------------------------------
+    # Mod packages (.fh2mod) — portable, shareable, re-editable bundles
+    #
+    # Distinct from build_overlay_bytes()/save(): those produce game-ready
+    # AGG bytes for ONE install. A .fh2mod is just the staged *changes*
+    # themselves (raw entry bytes + replacement music + a manifest), meant
+    # to be reopened later, handed to someone else, or kept under version
+    # control — independent of any particular fheroes2 install.
+    # ------------------------------------------------------------------
+
+    MOD_PACKAGE_FORMAT_VERSION: ClassVar[int] = 1
+
+    def export_mod_package(self, out_path: str, name: str,
+                            author: str = "", description: str = "") -> list[str]:
+        """Write every currently staged replacement to a single .fh2mod zip."""
+        log: list[str] = []
+        manifest: dict = {
+            "format_version": self.MOD_PACKAGE_FORMAT_VERSION,
+            "name": name,
+            "author": author,
+            "description": description,
+            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "agg_entries": [],
+            "music_tracks": [],
+        }
+
+        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for entry_name, data in self._pending.items():
+                arc_name = f"assets/agg/{entry_name}"
+                zf.writestr(arc_name, data)
+                manifest["agg_entries"].append({"name": entry_name, "asset_file": arc_name})
+                log.append(f"  + {entry_name} ({len(data):,} bytes)")
+
+            for mt in self.music_tracks:
+                if mt.replaced and mt.replacement_path and os.path.isfile(mt.replacement_path):
+                    ext = os.path.splitext(mt.replacement_path)[1] or ".ogg"
+                    safe_name = f"track_{mt.track.track_id}{ext}"
+                    arc_name = f"assets/music/{safe_name}"
+                    zf.write(mt.replacement_path, arc_name)
+                    manifest["music_tracks"].append({
+                        "track_id": mt.track.track_id,
+                        "enum_name": mt.track.enum_name,
+                        "asset_file": arc_name,
+                    })
+                    log.append(f"  + music: {mt.track.friendly_name} ({safe_name})")
+
+            zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+
+        total = len(manifest["agg_entries"]) + len(manifest["music_tracks"])
+        log.append(f"Wrote {out_path} — {total} staged change(s) packaged")
+        return log
+
+    def import_mod_package(self, in_path: str) -> list[str]:
+        """Load a .fh2mod package and stage all its replacements onto this
+        (already-open) project. Writes nothing to disk by itself — follow up
+        with build_overlay_bytes()/save() as usual once you're ready to apply.
+        """
+        log: list[str] = []
+        if not self.is_open():
+            log.append("ERROR: open an AGG before importing a mod package.")
+            return log
+
+        with zipfile.ZipFile(in_path, "r") as zf:
+            try:
+                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            except KeyError:
+                log.append("ERROR: not a valid .fh2mod file (missing manifest.json).")
+                return log
+
+            fmt = manifest.get("format_version", 0)
+            if fmt > self.MOD_PACKAGE_FORMAT_VERSION:
+                log.append(
+                    f"WARNING: package format v{fmt} is newer than this tool's "
+                    f"v{self.MOD_PACKAGE_FORMAT_VERSION}; some data may be skipped."
+                )
+
+            mod_name = manifest.get("name") or "(unnamed)"
+            log.append(f'Importing mod "{mod_name}" by {manifest.get("author") or "unknown"}')
+
+            for entry in manifest.get("agg_entries", []):
+                name = entry.get("name", "")
+                arc_name = entry.get("asset_file", "")
+                if not name or not arc_name:
+                    continue
+                try:
+                    data = zf.read(arc_name)
+                except KeyError:
+                    log.append(f"  ! missing asset for {name}, skipped")
+                    continue
+                self._pending[name] = data
+                self._refresh_asset(name)
+                note = "" if name in self._entries else "  [not present in the currently open AGG]"
+                log.append(f"  + staged {name} ({len(data):,} bytes){note}")
+
+            music_entries = manifest.get("music_tracks", [])
+            if music_entries:
+                cache_dir = tempfile.mkdtemp(prefix="fh2studio_import_")
+                for entry in music_entries:
+                    track_id = entry.get("track_id")
+                    arc_name = entry.get("asset_file", "")
+                    if track_id is None or not arc_name:
+                        continue
+                    match = next((mt for mt in self.music_tracks
+                                  if mt.track.track_id == track_id), None)
+                    if match is None:
+                        log.append(f"  ! unknown music track_id={track_id}, skipped")
+                        continue
+                    try:
+                        data = zf.read(arc_name)
+                    except KeyError:
+                        log.append(f"  ! missing music asset for track {track_id}, skipped")
+                        continue
+                    dest = os.path.join(cache_dir, os.path.basename(arc_name))
+                    with open(dest, "wb") as f:
+                        f.write(data)
+                    self.stage_music_replacement(match.track, dest)
+                    log.append(f"  + staged music: {match.track.friendly_name}")
+
+        return log
+
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
@@ -198,20 +348,29 @@ class Project:
             f.write(new_agg)
         log.append(f"Wrote {out_path} ({len(new_agg):,} bytes, {len(patched)} entries)")
 
-        # Handle music replacements
-        if music_out_dir:
-            os.makedirs(music_out_dir, exist_ok=True)
-            for mt in self.music_tracks:
-                if mt.replaced and mt.replacement_path:
-                    # Use the MAPPED naming scheme as target
-                    ext = os.path.splitext(mt.replacement_path)[1]
-                    dest_name = mt.track.mapped_name(ext)
-                    dest = os.path.join(music_out_dir, dest_name)
-                    shutil.copy2(mt.replacement_path, dest)
-                    mt.installed_path = dest
-                    mt.replaced = False
-                    log.append(f"  Music: copied {dest_name}")
+        log.extend(self.save_music(music_out_dir))
+        return log
 
+    def save_music(self, music_out_dir: str) -> list[str]:
+        """Copy any staged music replacements into ``music_out_dir``.
+
+        Split out from ``save()`` so callers that build a HEROES2X.AGG
+        overlay (rather than a full patched AGG) can still perform the
+        music-copy step on its own.
+        """
+        log: list[str] = []
+        if not music_out_dir:
+            return log
+        os.makedirs(music_out_dir, exist_ok=True)
+        for mt in self.music_tracks:
+            if mt.replaced and mt.replacement_path:
+                ext = os.path.splitext(mt.replacement_path)[1]
+                dest_name = mt.track.mapped_name(ext)
+                dest = os.path.join(music_out_dir, dest_name)
+                shutil.copy2(mt.replacement_path, dest)
+                mt.installed_path = dest
+                mt.replaced = False
+                log.append(f"  Music: copied {dest_name}")
         return log
 
     # ------------------------------------------------------------------

@@ -221,6 +221,79 @@ def _ask_three_way(parent: tk.Tk, title: str, message: str,
     return result["value"]
 
 
+def _ask_mod_metadata(parent: tk.Tk) -> tuple[str, str, str] | None:
+    """Modal dialog collecting Name / Author / Description for a mod export.
+    Returns (name, author, description), or None if cancelled."""
+    result: dict[str, tuple | None] = {"value": None}
+
+    win = tk.Toplevel(parent)
+    win.title("Export Mod Package")
+    win.configure(bg=C_BG)
+    win.transient(parent)
+    win.resizable(False, False)
+
+    body = tk.Frame(win, bg=C_BG, padx=20, pady=16)
+    body.pack(fill="both", expand=True)
+
+    tk.Label(body, text="Export Mod Package", bg=C_BG, fg=C_TEXT, font=FONT_TITLE,
+             anchor="w").pack(fill="x", pady=(0, 12))
+
+    def labeled_entry(label_text: str, required: bool = False):
+        tk.Label(body, text=label_text + (" *" if required else ""), bg=C_BG,
+                 fg=C_SUBTEXT, font=FONT_SMALL, anchor="w").pack(fill="x")
+        var = tk.StringVar()
+        entry = tk.Entry(body, textvariable=var, bg=C_ACCENT2, fg=C_TEXT,
+                          insertbackground=C_TEXT, relief="flat", font=FONT_BODY)
+        entry.pack(fill="x", pady=(2, 10))
+        return var, entry
+
+    name_var, name_entry = labeled_entry("Mod name", required=True)
+    author_var, author_entry = labeled_entry("Author (optional)")
+
+    tk.Label(body, text="Description (optional)", bg=C_BG, fg=C_SUBTEXT,
+             font=FONT_SMALL, anchor="w").pack(fill="x")
+    desc_text = tk.Text(body, height=4, width=42, bg=C_ACCENT2, fg=C_TEXT,
+                         insertbackground=C_TEXT, relief="flat", font=FONT_BODY, wrap="word")
+    desc_text.pack(fill="x", pady=(2, 14))
+
+    btn_row = tk.Frame(body, bg=C_BG)
+    btn_row.pack(fill="x")
+
+    def confirm(_evt=None) -> None:
+        name = name_var.get().strip()
+        if not name:
+            name_entry.focus_set()
+            return
+        result["value"] = (name, author_var.get().strip(), desc_text.get("1.0", "end").strip())
+        win.destroy()
+
+    def cancel() -> None:
+        result["value"] = None
+        win.destroy()
+
+    tk.Button(btn_row, text="Export", command=confirm,
+              bg=C_ACCENT2, fg=C_TEXT, activebackground=C_ACCENT,
+              relief="flat", padx=14, pady=6).pack(side="right", padx=(6, 0))
+    tk.Button(btn_row, text="Cancel", command=cancel,
+              bg=C_PANEL, fg=C_SUBTEXT, activebackground=C_BORDER,
+              relief="flat", padx=14, pady=6).pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", cancel)
+    name_entry.bind("<Return>", confirm)
+    author_entry.bind("<Return>", confirm)
+
+    win.update_idletasks()
+    px, py = parent.winfo_rootx(), parent.winfo_rooty()
+    pw, ph = parent.winfo_width(), parent.winfo_height()
+    ww, wh = win.winfo_width(), win.winfo_height()
+    win.geometry(f"+{px + (pw - ww)//2}+{py + (ph - wh)//2}")
+
+    name_entry.focus_set()
+    win.grab_set()
+    win.wait_window()
+    return result["value"]
+
+
 def _checker_bg(size: int) -> Image.Image:
     img = Image.new("RGB", (size, size))
     pix = img.load()
@@ -338,9 +411,7 @@ class Studio(tk.Tk):
         btn_frame.pack(side="right", padx=8)
         self._btn("Connect fheroes2", self._connect_fheroes2, btn_frame, accent=True)
         self._btn("Open AGG…",        self._open_agg,         btn_frame, accent=False)
-        self._btn("Apply Mod",        self._apply_mod,        btn_frame, accent=True)
-        self._btn("Restore…",         self._restore_mods,     btn_frame, accent=False)
-        self._btn("Save Mod…",        self._save_mod,         btn_frame, accent=False)
+        self._build_menu_bar()
 
         # ── status bar ──────────────────────────────────────────────────────
         self._status_var = tk.StringVar(value="No file open — use 'Open AGG…' to load HEROES2.AGG")
@@ -367,6 +438,21 @@ class Studio(tk.Tk):
         right = tk.Frame(paned, bg=C_PANEL, width=220)
         paned.add(right, minsize=160)
         self._build_log(right)
+
+    def _build_menu_bar(self) -> None:
+        menubar = tk.Menu(self, tearoff=False)
+
+        mod_menu = tk.Menu(menubar, tearoff=False)
+        mod_menu.add_command(label="Apply Mod",            command=self._apply_mod)
+        mod_menu.add_command(label="Restore Backup…",       command=self._restore_mods)
+        mod_menu.add_separator()
+        mod_menu.add_command(label="Export Mod Package…",   command=self._export_mod_package)
+        mod_menu.add_command(label="Import Mod Package…",  command=self._import_mod_package)
+        mod_menu.add_separator()
+        mod_menu.add_command(label="Save Full AGG Copy…",  command=self._save_mod)
+        menubar.add_cascade(label="Mod", menu=mod_menu)
+
+        self.config(menu=menubar)
 
     def _btn(self, text: str, cmd, parent: tk.Widget, accent: bool = False) -> tk.Button:
         bg = C_BTN_ACT if accent else C_BTN
@@ -1019,6 +1105,71 @@ class Studio(tk.Tk):
             self._log(f"Deleted {overlay_path} (was created by fh2_studio)")
 
         messagebox.showinfo("Restored", "Original files restored.")
+
+    def _export_mod_package(self) -> None:
+        if not self.project.is_open():
+            messagebox.showinfo("Nothing to export", "Open an AGG file first.")
+            return
+        if not self.project.has_pending_changes:
+            messagebox.showinfo("Nothing to export", "No pending changes staged yet.")
+            return
+
+        meta = _ask_mod_metadata(self)
+        if meta is None:
+            return
+        name, author, description = meta
+
+        safe_stem = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip() or "mod"
+        path = filedialog.asksaveasfilename(
+            title="Export Mod Package",
+            defaultextension=".fh2mod",
+            initialfile=f"{safe_stem}.fh2mod",
+            filetypes=[("fh2_studio mod package", "*.fh2mod"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        try:
+            lines = self.project.export_mod_package(path, name, author, description)
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+            return
+        for line in lines:
+            self._log(line)
+        messagebox.showinfo("Exported", f'"{name}" saved to:\n{path}')
+
+    def _import_mod_package(self) -> None:
+        if not self.project.is_open():
+            messagebox.showinfo("Open an AGG first",
+                                 "Connect to fheroes2 or open an AGG before importing a mod.")
+            return
+
+        path = filedialog.askopenfilename(
+            title="Import Mod Package",
+            filetypes=[("fh2_studio mod package", "*.fh2mod"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+
+        try:
+            lines = self.project.import_mod_package(path)
+        except Exception as e:
+            messagebox.showerror("Import failed", str(e))
+            return
+        for line in lines:
+            self._log(line)
+
+        # Refresh the browser/music list, and re-load whatever's on screen in
+        # case the import just replaced the asset currently being previewed.
+        self._populate_browser()
+        self._populate_music_list()
+        if self._sel_asset is not None:
+            if self._sel_asset.atype == AssetType.SPRITE:
+                self._load_sprite(self._sel_asset)
+            elif self._sel_asset.atype == AssetType.SOUND:
+                self._load_sound(self._sel_asset)
+
+        messagebox.showinfo("Imported", "Mod package staged. Review the changes, then use Mod → Apply Mod.")
 
     def _save_mod(self) -> None:
         if not self.project.is_open():
