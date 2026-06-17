@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -19,7 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PIL import Image, ImageTk                                   # noqa: E402
-from fh2agg.aggfile import AggFormatError                        # noqa: E402
+from fh2agg.aggfile import AggFormatError, build_agg, parse_agg     # noqa: E402
 from fh2agg.icn import (ICNHeader, build_icn, decode_sprite,    # noqa: E402
                           encode_sprite, parse_icn)
 from fh2agg.palette import NearestColorMatcher, load_palette     # noqa: E402
@@ -128,6 +129,98 @@ def _music_dir_for_agg(agg_path: str) -> str:
     return ""
 
 
+# ── HEROES2X.AGG overlay helpers ────────────────────────────────────────────
+# fheroes2 looks for a second AGG file next to the main one: it lowercases
+# the main AGG's path, replaces the trailing ".agg" with "x.agg", and looks
+# for any other .agg file in the same folder whose lowercased path matches
+# exactly. If found AND it opens successfully, the engine treats Price of
+# Loyalty as installed (Settings::EnablePriceOfLoyaltySupport(true)) and
+# checks this file FIRST for every asset lookup, falling back to the main
+# AGG only if an entry isn't there. Verified directly against fheroes2's
+# AGG::AGGInitializer::init() in src/fheroes2/agg/agg.cpp.
+
+def _overlay_filename_for(base_agg_path: str) -> str:
+    """Return the conventional overlay filename for a given base AGG path,
+    e.g. 'HEROES2.AGG' -> 'HEROES2X.AGG' (case pattern preserved)."""
+    base = os.path.basename(base_agg_path)
+    stem, ext = os.path.splitext(base)
+    suffix = "X" if stem == stem.upper() else "x"
+    return f"{stem}{suffix}{ext}"
+
+
+def _find_existing_overlay(data_dir: str, base_agg_path: str) -> str | None:
+    """Search data_dir for an existing overlay AGG using fheroes2's exact
+    case-insensitive matching rule. Returns the real on-disk path (with its
+    real casing) if found, else None."""
+    if not os.path.isdir(data_dir):
+        return None
+    base_lower = os.path.basename(base_agg_path).lower()
+    if not base_lower.endswith(".agg"):
+        return None
+    target_lower = base_lower[: -len(".agg")] + "x.agg"
+    try:
+        for fname in os.listdir(data_dir):
+            if fname.lower() == target_lower:
+                return os.path.join(data_dir, fname)
+    except OSError:
+        pass
+    return None
+
+
+def _ask_three_way(parent: tk.Tk, title: str, message: str,
+                    opt1: str, opt2: str, cancel: str = "Cancel") -> str | None:
+    """Modal dialog with three clearly-labelled buttons.
+
+    Returns "opt1", "opt2", or None if cancelled / closed.
+    Used instead of messagebox.askyesnocancel because its generic
+    Yes/No/Cancel labels are too easy to misread for a risky choice.
+    """
+    result: dict[str, str | None] = {"value": None}
+
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.configure(bg=C_BG)
+    win.transient(parent)
+    win.resizable(False, False)
+
+    body = tk.Frame(win, bg=C_BG, padx=20, pady=16)
+    body.pack(fill="both", expand=True)
+
+    tk.Label(body, text=title, bg=C_BG, fg=C_TEXT, font=FONT_TITLE,
+              anchor="w", justify="left").pack(fill="x", pady=(0, 8))
+    tk.Label(body, text=message, bg=C_BG, fg=C_SUBTEXT, font=FONT_BODY,
+              anchor="w", justify="left", wraplength=420).pack(fill="x", pady=(0, 16))
+
+    btn_row = tk.Frame(body, bg=C_BG)
+    btn_row.pack(fill="x")
+
+    def choose(value: str | None) -> None:
+        result["value"] = value
+        win.destroy()
+
+    tk.Button(btn_row, text=opt1, command=lambda: choose("opt1"),
+               bg=C_ACCENT2, fg=C_TEXT, activebackground=C_ACCENT,
+               relief="flat", padx=10, pady=6).pack(fill="x", pady=2)
+    tk.Button(btn_row, text=opt2, command=lambda: choose("opt2"),
+               bg=C_PANEL, fg=C_TEXT, activebackground=C_BORDER,
+               relief="flat", padx=10, pady=6).pack(fill="x", pady=2)
+    tk.Button(btn_row, text=cancel, command=lambda: choose(None),
+               bg=C_PANEL, fg=C_SUBTEXT, activebackground=C_BORDER,
+               relief="flat", padx=10, pady=6).pack(fill="x", pady=(2, 0))
+
+    win.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+    win.update_idletasks()
+    # Centre over the parent window
+    px, py = parent.winfo_rootx(), parent.winfo_rooty()
+    pw, ph = parent.winfo_width(), parent.winfo_height()
+    ww, wh = win.winfo_width(), win.winfo_height()
+    win.geometry(f"+{px + (pw - ww)//2}+{py + (ph - wh)//2}")
+
+    win.grab_set()
+    win.wait_window()
+    return result["value"]
+
+
 def _checker_bg(size: int) -> Image.Image:
     img = Image.new("RGB", (size, size))
     pix = img.load()
@@ -215,6 +308,11 @@ class Studio(tk.Tk):
         self._sel_music = None
         self._sel_sprite_idx = 0
         self._bg_mode        = "checker"   # cycles: checker → black → white → green
+        self._frame_rgba_cache: dict = {}   # idx -> decoded RGBA, cleared per ICN load
+        self._anim_playing   = False
+        self._anim_after_id  = None
+        self._anim_range     = (0, 0)
+        self._anim_loop      = True
         self._preview_photo: ImageTk.PhotoImage | None = None
         self._import_photo:  ImageTk.PhotoImage | None = None
         self._audio_thread: threading.Thread | None = None
@@ -240,7 +338,9 @@ class Studio(tk.Tk):
         btn_frame.pack(side="right", padx=8)
         self._btn("Connect fheroes2", self._connect_fheroes2, btn_frame, accent=True)
         self._btn("Open AGG…",        self._open_agg,         btn_frame, accent=False)
-        self._btn("Save Mod…",        self._save_mod,         btn_frame, accent=True)
+        self._btn("Apply Mod",        self._apply_mod,        btn_frame, accent=True)
+        self._btn("Restore…",         self._restore_mods,     btn_frame, accent=False)
+        self._btn("Save Mod…",        self._save_mod,         btn_frame, accent=False)
 
         # ── status bar ──────────────────────────────────────────────────────
         self._status_var = tk.StringVar(value="No file open — use 'Open AGG…' to load HEROES2.AGG")
@@ -424,6 +524,56 @@ class Studio(tk.Tk):
 
         self._btn("Export frame as PNG…", self._export_sprite_png, orig)
         self._bg_btn = self._btn("BG: Checker", self._cycle_bg, orig)
+
+        # --- Animation playback ---
+        anim = tk.LabelFrame(orig, text=" Animate ", bg=C_BG, fg=C_SUBTEXT,
+                              font=FONT_SMALL, relief="flat", bd=1,
+                              highlightbackground=C_BORDER)
+        anim.pack(fill="x", padx=8, pady=(4, 8))
+
+        range_row = tk.Frame(anim, bg=C_BG)
+        range_row.pack(fill="x", padx=6, pady=(6, 3))
+        tk.Label(range_row, text="From", bg=C_BG, fg=C_SUBTEXT,
+                 font=FONT_SMALL).pack(side="left")
+        self._anim_from_var = tk.IntVar(value=0)
+        self._anim_from_spin = tk.Spinbox(
+            range_row, from_=0, to=0, width=4, textvariable=self._anim_from_var,
+            bg=C_ACCENT2, fg=C_TEXT, insertbackground=C_TEXT, buttonbackground=C_PANEL,
+            relief="flat", font=FONT_SMALL, justify="center")
+        self._anim_from_spin.pack(side="left", padx=(4, 12))
+
+        tk.Label(range_row, text="To", bg=C_BG, fg=C_SUBTEXT,
+                 font=FONT_SMALL).pack(side="left")
+        self._anim_to_var = tk.IntVar(value=0)
+        self._anim_to_spin = tk.Spinbox(
+            range_row, from_=0, to=0, width=4, textvariable=self._anim_to_var,
+            bg=C_ACCENT2, fg=C_TEXT, insertbackground=C_TEXT, buttonbackground=C_PANEL,
+            relief="flat", font=FONT_SMALL, justify="center")
+        self._anim_to_spin.pack(side="left", padx=(4, 12))
+
+        tk.Button(range_row, text="All Frames", command=self._anim_select_all,
+                  bg=C_BTN, fg=C_TEXT, relief="flat", font=FONT_SMALL,
+                  padx=8, cursor="hand2").pack(side="left")
+
+        opt_row = tk.Frame(anim, bg=C_BG)
+        opt_row.pack(fill="x", padx=6, pady=(0, 6))
+        tk.Label(opt_row, text="FPS", bg=C_BG, fg=C_SUBTEXT,
+                 font=FONT_SMALL).pack(side="left")
+        self._anim_fps_var = tk.IntVar(value=8)
+        self._anim_fps_spin = tk.Spinbox(
+            opt_row, from_=1, to=60, width=4, textvariable=self._anim_fps_var,
+            bg=C_ACCENT2, fg=C_TEXT, insertbackground=C_TEXT, buttonbackground=C_PANEL,
+            relief="flat", font=FONT_SMALL, justify="center")
+        self._anim_fps_spin.pack(side="left", padx=(4, 14))
+
+        self._anim_loop_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(opt_row, text="Loop", variable=self._anim_loop_var,
+                        bg=C_BG, fg=C_TEXT, selectcolor=C_PANEL,
+                        activebackground=C_BG, activeforeground=C_TEXT,
+                        font=FONT_SMALL).pack(side="left")
+
+        self._anim_play_btn = self._btn("▶  Play Animation", self._toggle_anim_play,
+                                         anim, accent=True)
 
         # --- Import / replace side ---
         imp = tk.LabelFrame(cols, text=" Replace With ", bg=C_BG, fg=C_SUBTEXT,
@@ -687,65 +837,188 @@ class Studio(tk.Tk):
         )
         self._populate_browser()
 
-    def _deploy_to_fheroes2(self) -> None:
-        """Write the patched AGG (and music replacements) directly into the
-        connected fheroes2 install, after making a one-time backup."""
+    def _apply_mod(self) -> None:
+        """Apply staged sprite/sound/music changes to the connected fheroes2
+        install, preferring a non-destructive HEROES2X.AGG overlay whenever
+        it's safe to do so.
+
+        Why not always create an overlay: fheroes2 treats the mere presence
+        of a working HEROES2X.AGG as proof Price of Loyalty is installed
+        (it flips Settings::EnablePriceOfLoyaltySupport(true), which enables
+        the PoL campaign button, PoL-only heroes/artifacts in scenario
+        dialogs, etc.) A minimal overlay with just a few replaced sprites
+        would trip that flag without having the real expansion's assets
+        behind it, breaking those other features for anyone who doesn't
+        actually own Price of Loyalty. So: if a real HEROES2X.AGG already
+        exists, merging into it is fully safe (that flag was already on).
+        If none exists, the user gets an explicit, informed choice instead
+        of fh2_studio silently doing something that could break their game.
+        """
         if not self.project.is_open():
-            messagebox.showinfo("Nothing to deploy", "Open or connect an AGG file first.")
+            messagebox.showinfo("Nothing to apply", "Open or connect an AGG file first.")
             return
         if not self.project.has_pending_changes:
-            messagebox.showinfo("Nothing to deploy", "No pending changes staged yet.")
+            messagebox.showinfo("Nothing to apply", "No pending changes staged yet.")
             return
 
-        # Resolve target install dir
-        if not self._fheroes2_dir:
-            found = _find_fheroes2_dir()
-            if found:
-                use = messagebox.askyesno(
-                    "Deploy target",
-                    f"Deploy to fheroes2 install at:\n{found}?"
+        # Resolve the install's data directory from whatever AGG is open.
+        base_agg_path = self.project._agg_path
+        data_dir = os.path.dirname(base_agg_path)
+        if not os.path.isdir(data_dir):
+            messagebox.showerror("Error", f"Data folder not found:\n{data_dir}")
+            return
+
+        music_dir = self.project._music_dir or _music_dir_for_agg(base_agg_path) \
+            or os.path.join(os.path.dirname(data_dir), "music")
+
+        existing_overlay = _find_existing_overlay(data_dir, base_agg_path)
+        log_lines: list[str] = []
+
+        if self.project.has_pending_agg_changes:
+            if existing_overlay:
+                # ---- Safe path: a real overlay (almost certainly Price of
+                #      Loyalty) already exists — merge into it. ----
+                try:
+                    with open(existing_overlay, "rb") as f:
+                        existing_bytes = f.read()
+                    existing_entries = parse_agg(existing_bytes, verify_hashes=True)
+                except Exception as e:
+                    messagebox.showerror(
+                        "Cannot read existing overlay",
+                        f"{existing_overlay}\n\n{e}\n\n"
+                        "Fix or remove this file and try again."
+                    )
+                    return
+
+                if not messagebox.askyesno(
+                    "Apply mod",
+                    f"Found an existing overlay:\n{existing_overlay}\n"
+                    f"({len(existing_entries)} entries — likely Price of Loyalty data)\n\n"
+                    f"Your {len(self.project._pending)} change(s) will be merged into it. "
+                    "Everything else in that file is left untouched.\n\n"
+                    "A one-time backup will be made before the first change. Continue?"
+                ):
+                    return
+
+                backup_path = existing_overlay + ".bak"
+                if not os.path.isfile(backup_path):
+                    shutil.copy2(existing_overlay, backup_path)
+                    log_lines.append(f"Backup: {backup_path}")
+
+                new_bytes = self.project.build_overlay_bytes(existing_entries)
+                with open(existing_overlay, "wb") as f:
+                    f.write(new_bytes)
+                log_lines.append(
+                    f"Merged into overlay: {existing_overlay} "
+                    f"({len(existing_entries)} → {len(parse_agg(new_bytes, verify_hashes=False))} entries)"
                 )
-                self._fheroes2_dir = found if use else ""
-            if not self._fheroes2_dir:
-                self._fheroes2_dir = filedialog.askdirectory(
-                    title="Select fheroes2 install folder to deploy into"
-                ) or ""
-            if not self._fheroes2_dir:
-                return
 
-        data_dir  = os.path.join(self._fheroes2_dir, "data")
-        music_dir = _music_dir_for_agg(os.path.join(data_dir, "HEROES2.AGG")) or \
-                    os.path.join(self._fheroes2_dir, "music")
-        target_agg = os.path.join(data_dir, "HEROES2.AGG")
-        backup_agg = os.path.join(data_dir, "HEROES2.AGG.bak")
+            else:
+                # ---- No overlay exists yet — ask, don't assume. ----
+                choice = _ask_three_way(
+                    self,
+                    "No Price of Loyalty data found",
+                    "fheroes2 has no HEROES2X.AGG in this install. Creating one "
+                    "makes the game think Price of Loyalty is installed, which can "
+                    "break the PoL campaign menu and PoL-only heroes/artifacts if "
+                    "you don't actually own the expansion.\n\n"
+                    "Patching HEROES2.AGG directly is the safe default — a backup "
+                    "is made automatically and it never touches this PoL-detection flag.",
+                    opt1="Patch HEROES2.AGG  (safe, recommended)",
+                    opt2="Create HEROES2X.AGG anyway  (advanced)",
+                )
+                if choice is None:
+                    return
 
-        # Confirm with the user
-        if not messagebox.askyesno(
-            "Confirm deploy",
-            f"This will overwrite:\n{target_agg}\n\n"
-            f"A backup will be saved as HEROES2.AGG.bak (only on first deploy).\n\n"
-            "Continue?"
-        ):
-            return
+                if choice == "opt1":
+                    backup_path = base_agg_path + ".bak"
+                    if not os.path.isfile(backup_path):
+                        shutil.copy2(base_agg_path, backup_path)
+                        log_lines.append(f"Backup: {backup_path}")
+                    try:
+                        save_lines = self.project.save(base_agg_path, music_out_dir="")
+                    except Exception as e:
+                        messagebox.showerror("Apply failed", str(e))
+                        return
+                    log_lines.extend(save_lines)
 
-        # Create backup only if it doesn't already exist
-        import shutil
-        if not os.path.isfile(backup_agg) and os.path.isfile(target_agg):
-            shutil.copy2(target_agg, backup_agg)
-            self._log(f"Backup: {backup_agg}")
+                else:  # opt2 — create overlay from scratch
+                    overlay_name = _overlay_filename_for(base_agg_path)
+                    overlay_path = os.path.join(data_dir, overlay_name)
+                    new_bytes = self.project.build_overlay_bytes(None)
+                    with open(overlay_path, "wb") as f:
+                        f.write(new_bytes)
+                    # Marker so _restore_mods knows WE created this from
+                    # nothing and it's safe to delete on revert.
+                    open(overlay_path + ".fh2studio_created", "w").close()
+                    log_lines.append(
+                        f"Created experimental overlay: {overlay_path} "
+                        f"({len(self.project._pending)} entries)"
+                    )
+                    log_lines.append(
+                        "  Note: avoid the in-game Price of Loyalty campaign "
+                        "option unless you actually own the expansion."
+                    )
 
-        try:
-            lines = self.project.save(target_agg, music_out_dir=music_dir)
-        except Exception as e:
-            messagebox.showerror("Deploy failed", str(e))
-            return
-        for line in lines:
+        # Music is always handled the same way regardless of which AGG path
+        # was used above — it's loose files, never packed into an overlay.
+        log_lines.extend(self.project.save_music(music_dir))
+
+        for line in log_lines:
             self._log(line)
-        messagebox.showinfo(
-            "Deployed",
-            f"Changes written to:\n{target_agg}\n"
-            f"Music → {music_dir}"
+        messagebox.showinfo("Applied", "Mod changes applied.\nSee the log for details.")
+
+    def _restore_mods(self) -> None:
+        """Undo fh2_studio's changes in the connected install: restore any
+        *.bak backups, and delete any overlay this tool created from scratch
+        (tracked via a .fh2studio_created marker — never deletes a file we
+        didn't create ourselves)."""
+        if self.project.is_open():
+            data_dir = os.path.dirname(self.project._agg_path)
+        elif self._fheroes2_dir:
+            data_dir = os.path.join(self._fheroes2_dir, "data")
+        else:
+            messagebox.showinfo("Nothing to restore", "Connect to a fheroes2 install first.")
+            return
+
+        if not os.path.isdir(data_dir):
+            messagebox.showinfo("Nothing to restore", f"Folder not found:\n{data_dir}")
+            return
+
+        restores: list[tuple[str, str]] = []   # (backup_path, target_path)
+        deletes:  list[str] = []                # overlay paths to delete
+
+        for fname in os.listdir(data_dir):
+            full = os.path.join(data_dir, fname)
+            if fname.lower().endswith(".agg.bak"):
+                restores.append((full, full[: -len(".bak")]))
+            elif fname.endswith(".fh2studio_created"):
+                overlay_path = full[: -len(".fh2studio_created")]
+                if os.path.isfile(overlay_path):
+                    deletes.append(overlay_path)
+
+        if not restores and not deletes:
+            messagebox.showinfo("Nothing to restore", f"No fh2_studio backups or created files found in:\n{data_dir}")
+            return
+
+        preview = "\n".join(
+            [f"Restore:  {os.path.basename(t)}  (from {os.path.basename(b)})" for b, t in restores]
+            + [f"Delete:   {os.path.basename(p)}  (created by fh2_studio)" for p in deletes]
         )
+        if not messagebox.askyesno("Confirm restore", f"This will:\n\n{preview}\n\nContinue?"):
+            return
+
+        for backup_path, target_path in restores:
+            shutil.copy2(backup_path, target_path)
+            self._log(f"Restored {target_path} from {os.path.basename(backup_path)}")
+        for overlay_path in deletes:
+            os.remove(overlay_path)
+            marker = overlay_path + ".fh2studio_created"
+            if os.path.isfile(marker):
+                os.remove(marker)
+            self._log(f"Deleted {overlay_path} (was created by fh2_studio)")
+
+        messagebox.showinfo("Restored", "Original files restored.")
 
     def _save_mod(self) -> None:
         if not self.project.is_open():
@@ -867,28 +1140,62 @@ class Studio(tk.Tk):
     # ────────────────────────────────────────────────────────────────────────
 
     def _load_sprite(self, asset) -> None:
+        self._stop_anim()
         self._sel_sprite_idx = 0
+        self._frame_rgba_cache = {}
         raw = self.project.raw_bytes(asset.name)
         try:
             self._icn_headers, self._icn_data = parse_icn(raw)
         except Exception as e:
             self._log(f"Cannot parse {asset.name}: {e}")
             self._icn_headers, self._icn_data = [], []
+
+        last = max(0, len(self._icn_headers) - 1)
+        self._anim_from_var.set(0)
+        self._anim_to_var.set(last)
+        self._anim_from_spin.config(to=last)
+        self._anim_to_spin.config(to=last)
+
         self._show_sprite_frame()
 
-    def _show_sprite_frame(self) -> None:
+    def _decode_frame_rgba(self, idx: int) -> "Image.Image | None":
+        """Decode one sprite frame to RGBA, cached per-frame for the currently
+        loaded ICN. Cache is cleared in `_load_sprite` whenever a new asset opens."""
+        cached = self._frame_rgba_cache.get(idx)
+        if cached is not None:
+            return cached
+
+        hdr = self._icn_headers[idx]
+        if not self.project.palette or hdr.width <= 0 or hdr.height <= 0:
+            return None
+        try:
+            sprite_bytes = self._icn_data[idx]
+            image, transform = decode_sprite(sprite_bytes, hdr)
+            rgba, _ = sprite_to_images(image, transform, hdr.width, hdr.height,
+                                       self.project.palette)
+        except Exception as e:
+            self._log(f"Sprite render error (frame {idx}): {e}")
+            return None
+
+        self._frame_rgba_cache[idx] = rgba
+        return rgba
+
+    def _show_sprite_frame(self, idx: int | None = None) -> None:
         headers = getattr(self, "_icn_headers", [])
-        datas   = getattr(self, "_icn_data",    [])
         n = len(headers)
         if n == 0:
             self._orig_canvas.delete("all")
             self._frame_label.config(text="No frames")
             return
 
-        idx = max(0, min(self._sel_sprite_idx, n - 1))
+        if idx is None:
+            idx = self._sel_sprite_idx
+        idx = max(0, min(idx, n - 1))
         self._sel_sprite_idx = idx
         hdr = headers[idx]
-        self._frame_label.config(text=f"Frame {idx + 1} / {n}")
+
+        suffix = "  (playing)" if self._anim_playing else ""
+        self._frame_label.config(text=f"Frame {idx + 1} / {n}{suffix}")
 
         mono_flag = "  [MONO]" if hdr.animationFrames & 0x20 else ""
         self._dim_label.config(
@@ -900,45 +1207,11 @@ class Studio(tk.Tk):
                  f"Offset: ({hdr.offsetX}, {hdr.offsetY})\n"
                  f"animFlags: 0x{hdr.animationFrames:02X}")
 
-        if self.project.palette and hdr.width > 0 and hdr.height > 0:
-            try:
-                sprite_bytes = datas[idx]
-                image, transform = decode_sprite(sprite_bytes, hdr)
-
-                # --- Diagnostic logging ---
-                n_opaque      = sum(1 for t in transform if t == 0)
-                n_transparent = sum(1 for t in transform if t == 1)
-                n_special     = sum(1 for t in transform if t > 1)
-                total         = hdr.width * hdr.height
-                hex_preview   = sprite_bytes[:48].hex(" ") if sprite_bytes else "(empty)"
-                self._log(
-                    f"  {hdr.width}×{hdr.height}  data={len(sprite_bytes)}B  "
-                    f"opaque={n_opaque}  transp={n_transparent}  special={n_special}  "
-                    f"offsetData={hdr.offsetData}"
-                )
-                self._log(f"  bytes[0:48]={hex_preview}")
-                # Per-row transparent count — shows WHERE the transparency is
-                row_summary = []
-                for row in range(hdr.height):
-                    base = row * hdr.width
-                    t_count = sum(1 for x in range(hdr.width) if transform[base + x] == 1)
-                    row_summary.append(t_count)
-                # Only log rows that have ANY transparency
-                for row, tc in enumerate(row_summary):
-                    if tc > 0:
-                        self._log(f"    row {row:3d}: {tc:3d} transparent / {hdr.width}")
-                # --------------------------
-
-                rgba, _ = sprite_to_images(image, transform, hdr.width, hdr.height,
-                                           self.project.palette)
-                display = _composite_on_checker(rgba) if self._bg_mode == "checker" \
-                    else _composite_on_solid(rgba, self._bg_mode)
-                self._last_rgba = rgba
-            except Exception as e:
-                self._log(f"Sprite render error (frame {idx}): {e}")
-                import traceback; self._log(traceback.format_exc())
-                display = Image.new("RGB", (PREVIEW_SIZE, PREVIEW_SIZE), (30, 0, 50))
-                self._last_rgba = None
+        rgba = self._decode_frame_rgba(idx)
+        if rgba is not None:
+            display = _composite_on_checker(rgba) if self._bg_mode == "checker" \
+                else _composite_on_solid(rgba, self._bg_mode)
+            self._last_rgba = rgba
         else:
             if not self.project.palette:
                 self._log("No palette loaded — open an AGG that contains KB.PAL")
@@ -967,14 +1240,100 @@ class Studio(tk.Tk):
     def _prev_sprite(self) -> None:
         if not getattr(self, "_icn_headers", []):
             return
+        self._stop_anim()
         self._sel_sprite_idx = (self._sel_sprite_idx - 1) % len(self._icn_headers)
         self._show_sprite_frame()
 
     def _next_sprite(self) -> None:
         if not getattr(self, "_icn_headers", []):
             return
+        self._stop_anim()
         self._sel_sprite_idx = (self._sel_sprite_idx + 1) % len(self._icn_headers)
         self._show_sprite_frame()
+
+    # ── animation playback ──────────────────────────────────────────────────
+
+    def _anim_select_all(self) -> None:
+        n = len(getattr(self, "_icn_headers", []))
+        if n == 0:
+            return
+        self._anim_from_var.set(0)
+        self._anim_to_var.set(n - 1)
+
+    def _toggle_anim_play(self) -> None:
+        if self._anim_playing:
+            self._stop_anim()
+            return
+
+        n = len(getattr(self, "_icn_headers", []))
+        if n == 0:
+            messagebox.showinfo("Nothing to animate", "Select a sprite with at least one frame first.")
+            return
+
+        try:
+            frm = int(self._anim_from_var.get())
+            to  = int(self._anim_to_var.get())
+            fps = int(self._anim_fps_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showerror("Invalid input", "From / To / FPS must be whole numbers.")
+            return
+
+        frm = max(0, min(frm, n - 1))
+        to  = max(0, min(to,  n - 1))
+        if to < frm:
+            frm, to = to, frm
+        fps = max(1, min(fps, 60))
+
+        # Reflect any clamping back into the UI
+        self._anim_from_var.set(frm)
+        self._anim_to_var.set(to)
+        self._anim_fps_var.set(fps)
+
+        self._anim_range = (frm, to)
+        self._anim_interval_ms = max(1, round(1000 / fps))
+        self._anim_loop = bool(self._anim_loop_var.get())
+        self._anim_cur = frm
+        self._anim_playing = True
+
+        self._anim_from_spin.config(state="disabled")
+        self._anim_to_spin.config(state="disabled")
+        self._anim_fps_spin.config(state="disabled")
+        self._anim_play_btn.config(text="⏹  Stop Animation", bg=C_ACCENT)
+
+        self._anim_tick()
+
+    def _anim_tick(self) -> None:
+        if not self._anim_playing:
+            return
+
+        frm, to = self._anim_range
+        self._show_sprite_frame(self._anim_cur)
+
+        nxt = self._anim_cur + 1
+        if nxt > to:
+            if self._anim_loop:
+                nxt = frm
+            else:
+                self._stop_anim()
+                return
+        self._anim_cur = nxt
+        self._anim_after_id = self.after(self._anim_interval_ms, self._anim_tick)
+
+    def _stop_anim(self) -> None:
+        if not self._anim_playing:
+            return
+        if self._anim_after_id is not None:
+            try:
+                self.after_cancel(self._anim_after_id)
+            except Exception:
+                pass
+            self._anim_after_id = None
+        self._anim_playing = False
+        self._anim_play_btn.config(text="▶  Play Animation", bg=C_BTN_ACT)
+        self._anim_from_spin.config(state="normal")
+        self._anim_to_spin.config(state="normal")
+        self._anim_fps_spin.config(state="normal")
+        self._show_sprite_frame()   # restore the manually-selected static frame
 
     def _export_sprite_png(self) -> None:
         """Save the current sprite frame as a full-resolution RGBA PNG."""
